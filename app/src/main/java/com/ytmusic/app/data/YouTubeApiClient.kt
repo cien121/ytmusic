@@ -1,8 +1,8 @@
 package com.ytmusic.app.data
 
 import android.content.Context
-import com.github.TeamNewPipe.nanojson.JsonObject
-import com.github.TeamNewPipe.nanojson.JsonParser
+import com.grack.nanojson.JsonObject
+import com.grack.nanojson.JsonParser
 import com.ytmusic.app.auth.MicroGAccountManager
 import java.io.BufferedReader
 import java.io.InputStreamReader

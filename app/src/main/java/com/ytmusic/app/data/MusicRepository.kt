@@ -45,19 +45,12 @@ object MusicRepository {
             .map { it.toTrack() }
     }
 
-    /** YouTube Trending 榜单（kiosk 默认项，匿名可用）。失败时由调用方回退到搜索。 */
+    /** 热门榜单：用热门音乐搜索实现（kiosk API 各版本签名不稳定，搜索更可靠）。匿名可用。 */
     suspend fun getTrending(): Result<List<Track>> =
         withContext(Dispatchers.IO) {
             try {
-                val kioskList = ServiceList.YouTube.kioskList
-                val extractor = kioskList.getDefaultKioskExtractor(
-                    null, Localization.DEFAULT, ContentCountry.DEFAULT
-                )
-                extractor.fetchPage()
-                val info = KioskInfo.getInfo(extractor)
-                val items = info.relatedItems
-                    .filterIsInstance<StreamInfoItem>()
-                    .map { it.toTrack() }
+                val items = searchWithFilter("热门音乐", listOf("music_songs"))
+                    .ifEmpty { searchWithFilter("热门音乐", null) }
                 Result.success(items)
             } catch (e: Exception) {
                 Result.failure(e)
