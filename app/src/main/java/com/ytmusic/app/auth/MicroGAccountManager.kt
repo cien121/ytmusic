@@ -33,14 +33,48 @@ object MicroGAccountManager {
         val accountId: String
     )
 
-    /** 是否装了 MicroG（包名就是 com.google.android.gms，MicroG 冒充 GMS 提供接口） */
-    fun isMicroGInstalled(context: Context): Boolean {
-        return try {
-            context.packageManager.getPackageInfo("com.google.android.gms", 0)
-            true
-        } catch (e: PackageManager.NameNotFoundException) {
-            false
+    /** MicroG 的全部已知包名：只查第一个会漏掉 MicroG RE，必须全查 */
+    val MICROG_PACKAGES = listOf(
+        "com.google.android.gms",
+        "com.mgoogle.android.gms",
+        "app.revanced.microg"
+    )
+
+    /** 是否装了 MicroG（任一包名命中即算装） */
+    fun isMicroGInstalled(context: Context): Boolean =
+        getInstalledMicroGPackage(context) != null
+
+    /** 返回命中的 MicroG 包名，未装返回 null */
+    fun getInstalledMicroGPackage(context: Context): String? {
+        val pm = context.packageManager
+        for (pkg in MICROG_PACKAGES) {
+            try {
+                pm.getPackageInfo(pkg, 0)
+                return pkg
+            } catch (e: PackageManager.NameNotFoundException) {
+                // 继续查下一个包名
+            }
         }
+        return null
+    }
+
+    /**
+     * 登录失败原因翻译：不只给状态码，分清三种情况。
+     * ApiException 状态码：12501=用户取消，12500=无可用账号，
+     * 10=DEVELOPER_ERROR（MicroG 版本不支持），8=内部错误。
+     */
+    fun describeSignInError(e: Exception): String {
+        if (e is ApiException) {
+            return when (e.statusCode) {
+                12501 -> "已取消登录"
+                12500 -> "MicroG 里没有可用的谷歌账号：请先打开 MicroG 设置添加谷歌账号，再回 App 点登录"
+                10 -> "MicroG 版本不支持登录：请更新到最新版 MicroG RE 再试"
+                8 -> "MicroG 登录接口异常：请检查 MicroG 是否正常运行，或重装 MicroG 再试"
+                17 -> "MicroG 服务未连接：请打开 MicroG 设置检查服务状态"
+                else -> "登录失败（错误码 ${e.statusCode}）：请检查 MicroG 设置，或更新 MicroG 再试"
+            }
+        }
+        return "登录失败：${e.message ?: "未知错误"}，请检查 MicroG 设置"
     }
 
     fun getSignInClient(context: Context): GoogleSignInClient {
@@ -96,22 +130,21 @@ object MicroGAccountManager {
     }
 
     /**
-     * 第二步用：拿 YouTube API 的 OAuth token（歌单、喜欢的音乐等）。
-     * 走 GoogleAuthUtil + MicroG，scope 是 YouTube 只读；MVP 先备好不调用。
+     * 第二步用：拿 YouTube API 的 OAuth token（歌单、喜欢的音乐、订阅同步）。
+     * 走 GoogleAuthUtil + MicroG，scope 是 YouTube 只读；账号用已保存的邮箱重建，
+     * 不依赖登录当时的 GoogleSignInAccount 对象。
      */
-    suspend fun getYouTubeAuthToken(
-        context: Context,
-        account: GoogleSignInAccount
-    ): String? = withContext(Dispatchers.IO) {
-        try {
-            val gmsAccount = account.account ?: return@withContext null
-            GoogleAuthUtil.getToken(
-                context,
-                gmsAccount,
-                "oauth2:https://www.googleapis.com/auth/youtube.readonly"
-            )
-        } catch (e: Exception) {
-            null
+    suspend fun getYouTubeAuthToken(context: Context, email: String): String? =
+        withContext(Dispatchers.IO) {
+            try {
+                val gmsAccount = android.accounts.Account(email, "com.google")
+                GoogleAuthUtil.getToken(
+                    context,
+                    gmsAccount,
+                    "oauth2:https://www.googleapis.com/auth/youtube.readonly"
+                )
+            } catch (e: Exception) {
+                null
+            }
         }
-    }
 }

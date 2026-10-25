@@ -2,6 +2,7 @@ package com.ytmusic.app.player
 
 import android.content.ComponentName
 import android.content.Context
+import android.net.Uri
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
@@ -10,8 +11,10 @@ import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.MoreExecutors
 import com.ytmusic.app.data.AudioQuality
 import com.ytmusic.app.data.AudioQualitySelector
+import com.ytmusic.app.data.DownloadManager
 import com.ytmusic.app.data.MusicRepository
 import com.ytmusic.app.data.Track
+import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -24,13 +27,15 @@ import kotlinx.coroutines.launch
 /**
  * 播放控制中心（单例，UI 层只跟它打交道）。
  * 通过 MediaController 连 MusicService 的 ExoPlayer，App 在后台也能播。
- * 音质切换：不断当前播放进度，换流地址重播。
+ * 队列切歌、进度条、音质切换、本地已下载播放都在这里。
+ * 全部免费：无广告、后台播放、最高音质、离线下载，不设付费墙。
  */
 object PlayerManager {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var controller: MediaController? = null
     private var connecting = false
+    private var pollingStarted = false
 
     private val _currentTrack = MutableStateFlow<Track?>(null)
     val currentTrack: StateFlow<Track?> = _currentTrack.asStateFlow()
@@ -50,6 +55,27 @@ object PlayerManager {
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
+    /** 播放队列（点列表里的歌时整列进队列，可上一首/下一首） */
+    private val _queue = MutableStateFlow<List<Track>>(emptyList())
+    val queue: StateFlow<List<Track>> = _queue.asStateFlow()
+
+    private val _queueIndex = MutableStateFlow(0)
+    val queueIndex: StateFlow<Int> = _queueIndex.asStateFlow()
+
+    /** 当前播放进度（毫秒），播放页进度条用 */
+    private val _position = MutableStateFlow(0L)
+    val position: StateFlow<Long> = _position.asStateFlow()
+
+    /** 当前歌曲总时长（毫秒），未知为 0 */
+    private val _duration = MutableStateFlow(0L)
+    val duration: StateFlow<Long> = _duration.asStateFlow()
+
+    val hasNext: Boolean
+        get() = _queueIndex.value + 1 < _queue.value.size
+
+    val hasPrevious: Boolean
+        get() = _queueIndex.value > 0
+
     fun connect(context: Context) {
         if (controller != null || connecting) return
         connecting = true
@@ -64,12 +90,29 @@ object PlayerManager {
                     }
                 })
                 _isPlaying.value = controller?.isPlaying == true
+                startPositionPolling()
             } catch (e: Exception) {
                 _error.value = "播放器连接失败"
             } finally {
                 connecting = false
             }
         }, MoreExecutors.directExecutor())
+    }
+
+    private fun startPositionPolling() {
+        if (pollingStarted) return
+        pollingStarted = true
+        scope.launch {
+            while (true) {
+                delay(500)
+                val c = controller
+                if (c != null) {
+                    _position.value = c.currentPosition.coerceAtLeast(0L)
+                    val d = c.duration
+                    _duration.value = if (d > 0) d else 0L
+                }
+            }
+        }
     }
 
     private suspend fun ensureController(context: Context): MediaController? {
@@ -83,8 +126,81 @@ object PlayerManager {
         return controller
     }
 
-    /** 点一首歌：解析全量音频流 → 默认最高音质 → 播放 */
+    /** 点一首歌：单曲进队列 → 解析全量音频流 → 默认最高音质 → 播放 */
     fun play(context: Context, track: Track) {
+        _queue.value = listOf(track)
+        _queueIndex.value = 0
+        playTrackInternal(context, track)
+    }
+
+    /** 点列表里的歌：整列进队列，从点中的位置开始播，可切歌 */
+    fun playQueue(context: Context, tracks: List<Track>, index: Int) {
+        if (tracks.isEmpty()) return
+        val safeIndex = index.coerceIn(0, tracks.size - 1)
+        _queue.value = tracks
+        _queueIndex.value = safeIndex
+        playTrackInternal(context, tracks[safeIndex])
+    }
+
+    fun next(context: Context) {
+        val idx = _queueIndex.value + 1
+        if (idx < _queue.value.size) {
+            _queueIndex.value = idx
+            playTrackInternal(context, _queue.value[idx])
+        }
+    }
+
+    fun previous(context: Context) {
+        val idx = _queueIndex.value - 1
+        if (idx >= 0) {
+            _queueIndex.value = idx
+            playTrackInternal(context, _queue.value[idx])
+        } else {
+            controller?.seekTo(0)
+        }
+    }
+
+    /** 播已下载的本地文件（不走网络取流） */
+    fun playFile(context: Context, downloaded: DownloadManager.DownloadedTrack) {
+        val track = Track(
+            title = downloaded.title,
+            artist = downloaded.artist,
+            durationSec = 0,
+            thumbnailUrl = downloaded.thumbnailUrl,
+            streamUrl = downloaded.file.absolutePath
+        )
+        _queue.value = listOf(track)
+        _queueIndex.value = 0
+        _qualities.value = emptyList()
+        _selectedQuality.value = null
+        _currentTrack.value = track
+        _error.value = null
+        scope.launch {
+            val c = ensureController(context)
+            if (c == null) {
+                _error.value = "播放器未就绪，重试一次"
+                return@launch
+            }
+            val item = MediaItem.Builder()
+                .setUri(Uri.fromFile(downloaded.file))
+                .setMediaMetadata(
+                    MediaMetadata.Builder()
+                        .setTitle(track.title)
+                        .setArtist(track.artist)
+                        .build()
+                )
+                .build()
+            c.setMediaItem(item)
+            c.prepare()
+            c.play()
+        }
+    }
+
+    fun seekTo(positionMs: Long) {
+        controller?.seekTo(positionMs.coerceAtLeast(0L))
+    }
+
+    private fun playTrackInternal(context: Context, track: Track) {
         scope.launch {
             _isLoading.value = true
             _error.value = null
@@ -138,7 +254,7 @@ object PlayerManager {
                 MediaMetadata.Builder()
                     .setTitle(track.title)
                     .setArtist(track.artist)
-                    .setArtworkUri(android.net.Uri.parse(track.thumbnailUrl))
+                    .setArtworkUri(Uri.parse(track.thumbnailUrl))
                     .build()
             )
             .build()
